@@ -1,0 +1,75 @@
+# Notes stay on your machine. Only starter-kit paths are tracked.
+*
+!*/
+!/.github/
+!/.github/**
+!/Hosts/
+!/Hosts/**
+!/_Scripts/
+!/_Scripts/**
+!/_Templates/
+!/_Templates/**
+!/assets/
+!/assets/**
+!/AGENTS.md
+!/CHANGELOG.md
+!/CLAUDE.md
+!/CODE_OF_CONDUCT.md
+!/CONTRIBUTING.md
+!/DESIGN.md
+!/Graph colors.md
+!/How this vault works.md
+!/How to set up.md
+!/How to use the brain.md
+!/LICENSE
+!/Parameters.md
+!/Prerequisites.md
+!/Preferences.md
+!/Prefixes.md
+!/README.md
+!/SECURITY.md
+!/Terms.md
+!/Hosts.md
+!/publish-denylist.example
+!/.gitignore
+!/Index.md
+!/Workspace map.example.md
+!/_Config/
+!/_Config/bootstrap.md
+!/Work/
+!/Work/Example/
+!/Work/Example/Example.md
+!/Collaboration/
+!/Collaboration/Collaboration.md
+!/Hackathons/
+!/Hackathons/Hackathons.md
+!/Research/
+!/Research/Research.md
+!/Personal/
+!/Personal/Personal.md
+!/Personal/
+!/Personal/Chats/
+!/Personal/Chats/Chats.md
+/_Scripts/host-restore/
+/Workspace map.md
+/.claude/settings.local.json
+/.claude/hooks/notedbro.py
+/.notedbro-local/
+!/Workspace map.advanced.example.md
+!/Advanced configuration.md
+!/Maintainer guide.md
+!/Troubleshooting.md
+!/Migration 1.1.0.md
+!/Release 1.1.0.md
+!/Change report 1.1.0.md
+*.canvas
+*.jsonl
+.DS_Store
+.env
+*.pem
+*.age
+shadow.key
+__pycache__/
+# >>> brain-guard
+report.md
+# <<< brain-guard
