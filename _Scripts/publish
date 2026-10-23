@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""Build the public starter kit from an include list, scan it, then swap it in.
+
+Nothing outside the include list is copied. Generated files are written into
+the same temporary tree, and the whole tree is scanned before the swap. A hit
+leaves the previous folder untouched.
+"""
+
+import getpass
+import importlib.machinery
+import importlib.util
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import publish_scan  # noqa: E402
+from publish_scan import map_terms, read_terms, scan_text_hits  # noqa: E402
+from vault_path import vault_root  # noqa: E402
+
+VAULT = vault_root()
+OUT = Path(os.path.expanduser(os.environ.get("BRAIN_PUBLISH_DIR", "~/.local/share/brain/publish")))
+DENYLIST = Path(os.path.expanduser(os.environ.get("BRAIN_PUBLISH_DENYLIST", "~/.config/brain/publish-denylist")))
+REPO_URL = publish_scan.PUBLIC_REPO
+API_REPO = publish_scan.PUBLIC_API
+PRODUCT = REPO_URL.rsplit("/", 1)[1]
+
+GENERATED = {
+    ".gitignore",
+    "Index.md",
+    "Workspace map.example.md",
+    "_Config/bootstrap.md",
+    "Work/Example/Example.md",
+    "Collaboration/Collaboration.md",
+    "Hackathons/Hackathons.md",
+    "Research/Research.md",
+    "Personal/Personal.md",
+    "Personal/Chats/Chats.md",
+}
+INCLUDE_FILES = (
+    "How this vault works.md",
+    "How to use the brain.md",
+    "Prefixes.md",
+    "Parameters.md",
+    "Preferences.md",
+    "Hosts.md",
+    "Terms.md",
+    "Graph colors.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    "Prerequisites.md",
+    "How to set up.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "DESIGN.md",
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
+    "LICENSE",
+)
+INCLUDE_DIRS = ("Hosts", ".github", "_Templates", "_Scripts", "assets")
+EXCLUDE_PARTS = {"host-restore", "__pycache__", ".DS_Store"}
+HUBS = (
+    ("Work/Example", "Example"),
+    ("Personal", "Personal"),
+    ("Collaboration", "Collaboration"),
+    ("Hackathons", "Hackathons"),
+    ("Research", "Research"),
+)
+AREAS = ("Personal", "Work", "Collaboration", "Hackathons", "Research", "Plans")
+
+EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+PHONE = re.compile(r"(?<![\w.-])(?:\+?\d{1,3}[ .-])?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}(?![\w.-])")
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp"}
+ALLOWED_URL = publish_scan.ALLOWED_URL
+
+
+def assert_outside(path, vault, label):
+    resolved = path.resolve()
+    root = vault.resolve()
+    if resolved == root or root in resolved.parents:
+        raise SystemExit(f"Refused to write inside the vault: {label}")
+    if resolved == Path.home().resolve() or resolved == Path("/") or len(resolved.parts) < 4:
+        raise SystemExit(f"Refused to write {label} at {resolved}")
+
+
+def load_script(name):
+    path = Path(__file__).resolve().with_name(name)
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def iter_files(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name != ".git")
+        for name in sorted(filenames):
+            yield Path(dirpath) / name
+
+
+def included(vault):
+    """Manifest paths to copy, plus entries that are missing. Generated paths are skipped."""
+    files, dirs = publish_scan.read_manifest(vault)
+    if not files and not dirs:
+        return [], ["_Scripts/starter-manifest.txt"]
+    found = []
+    missing = []
+    for name in files:
+        if name in GENERATED:
+            continue
+        if (vault / name).is_file():
+            found.append(Path(name))
+        else:
+            missing.append(name)
+    for folder in dirs:
+        root = vault / folder
+        if not root.is_dir():
+            missing.append(folder)
+            continue
+        for path in iter_files(root):
+            rel = path.relative_to(vault)
+            if set(rel.parts) & EXCLUDE_PARTS or path.is_symlink():
+                continue
+            found.append(rel)
+    return found, missing
+
+
+def hub_text(template, title, folder):
+    text = template.replace("`Work/{{title}}/`", f"`{folder}/`")
+    return text.replace("{{title}}", title)
+
+
+def index_text():
+    return (
+        "---\ntags: [meta]\n---\n# Index\n\n"
+        "My notes vault. Each area is **self-contained**: its notes link only to each other. "
+        "How it's organised: [[How this vault works]]. How to use it: [[How to use the brain]]. "
+        "What the words and tags mean: [[Terms]].\n\n"
+        "## Work\n- [[Example]] — a sample company area. Copy `_Templates/Area.md` into `Work/<Company>/` for each real one.\n\n"
+        "## Personal\n- [[Personal]] — my own projects\n- [[Chats]] — chats that match no project\n\n"
+        "## Collaboration\n- [[Collaboration]] — projects built with others\n\n"
+        "## Research\n- [[Research]] — questions and thesis work\n\n"
+        "## Hackathons\n- [[Hackathons]] — events to remember\n\n"
+        "## Parameters\n"
+        "- [[Parameters]] — standing rules for any model, in any project\n"
+        "- [[Prefixes]] — phrases I say, and what each one does\n"
+        "- [[Preferences]] — standing preferences, applied by scope\n"
+        "- [[Hosts]] — one row per app; profiles in `Hosts/`\n"
+    )
+
+
+def chats_text():
+    return (
+        "---\ntags: [project, personal]\n---\n# Chats\n\n"
+        "Chats that match no project, and every web chat. Back to [[Personal]].\n"
+    )
+
+
+def gitignore_text(vault=None):
+    """Star-ignore, then descend, then un-ignore only manifest paths."""
+    files, dirs = publish_scan.read_manifest(vault or VAULT)
+    lines = [
+        "# Notes stay on your machine. Only starter-kit paths are tracked.",
+        "*",
+        "!*/",
+    ]
+    for folder in dirs:
+        lines.append("!/" + folder)
+        lines.append("!/" + folder + "**")
+    for name in files:
+        if any(name.startswith(folder) for folder in dirs):
+            continue
+        parts = name.split("/")
+        for depth in range(1, len(parts)):
+            lines.append("!/" + "/".join(parts[:depth]) + "/")
+        lines.append("!/" + name)
+    lines += [
+        "/_Scripts/host-restore/",
+        "/Workspace map.md",
+        "*.canvas",
+        "*.jsonl",
+        ".DS_Store",
+        ".env",
+        "*.pem",
+        "*.age",
+        "shadow.key",
+        "__pycache__/",
+        "# >>> brain-guard",
+        "# <<< brain-guard",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def build_tree(vault, dest):
+    """Copy the include list and write the generated files. Returns missing entries."""
+    files, missing = included(vault)
+    for rel in files:
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(vault / rel, target)
+    template = (dest / "_Templates" / "Area.md")
+    area = template.read_text() if template.is_file() else "---\ntags: [area]\n---\n# {{title}}\n\nBack to [[Index]].\n"
+    for folder, title in HUBS:
+        write(dest / folder / f"{title}.md", hub_text(area, title, folder))
+    write(dest / "Personal" / "Chats" / "Chats.md", chats_text())
+    write(dest / "Index.md", index_text())
+    example = dest / "_Templates" / "Workspace map.md"
+    if example.is_file():
+        write(dest / "Workspace map.example.md", example.read_text())
+    else:
+        missing.append("_Templates/Workspace map.md")
+    write(dest / ".gitignore", gitignore_text(vault))
+    bootstrap = load_script("build-bootstrap")
+    write(dest / "_Config" / "bootstrap.md", bootstrap.render(dest))
+    return missing
+
+
+def scan(root, terms):
+    return publish_scan.scan(
+        root, terms, product=PRODUCT,
+        allow_product_paths={
+            "CHANGELOG.md", "DESIGN.md", "README.md", "Prefixes.md", "How to use the brain.md",
+            "_Config/bootstrap.md",
+        },
+        allowed_url=ALLOWED_URL,
+    )
+
+
+def check_tree(root):
+    checker = load_script("check-vault")
+    return [f"check-vault: {problem}" for problem in checker.check(root)]
+
+
+def shown(path):
+    home = str(Path.home())
+    text = str(path)
+    return "~" + text[len(home):] if text.startswith(home + os.sep) else text
+
+
+def swap(staging, out):
+    """Replace out with staging, carrying out/.git across. .git survives a failure."""
+    git = out / ".git"
+    moved = git.is_dir()
+    if moved:
+        shutil.move(str(git), str(staging / ".git"))
+    old = out.with_name(out.name + ".old")
+    if old.exists():
+        shutil.rmtree(old)
+    try:
+        if out.exists():
+            os.replace(out, old)
+        os.replace(staging, out)
+    except OSError:
+        if old.exists() and not out.exists():
+            os.replace(old, out)
+        if moved and (staging / ".git").is_dir():
+            shutil.move(str(staging / ".git"), str(git))
+        raise
+    if old.exists():
+        shutil.rmtree(old)
+
+
+def publish(vault=VAULT, out=OUT, denylist=DENYLIST):
+    if not publish_scan.maintainer_ready(vault, denylist):
+        return publish_scan.MAINTAINER_MESSAGE, False
+    denied = publish_scan.denylist_problems(denylist)
+    if denied:
+        return "\n".join(denied + [publish_scan.LOCAL_LINE]), False
+    try:
+        path = Path(__file__).resolve().with_name("guard")
+        loader = importlib.machinery.SourceFileLoader("guard_script", str(path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        module.run(vault, verbose=False)
+    except Exception:
+        pass
+    assert_outside(out, vault, "publish folder")
+    if out.is_symlink():
+        raise SystemExit("Refused to replace a symlinked publish folder")
+    out.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{out.name}-", dir=out.parent))
+    assert_outside(staging, vault, "publish folder")
+    try:
+        missing = build_tree(vault, staging)
+        problems = [f"{name}: missing from the vault" for name in missing]
+        scanned = scan(staging, read_terms(denylist) + map_terms(vault))
+        problems += scanned
+        problems += check_tree(staging)
+        if problems:
+            if scanned:
+                problems.append(publish_scan.LOCAL_LINE)
+            return "\n".join(problems + ["Publish withheld."]), False
+        swap(staging, out)
+        return f"Published: {shown(out)}", True
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def ignored(repo, rel):
+    result = subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", "--no-index", rel], capture_output=True)
+    return result.returncode == 0
+
+
+def self_check():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        vault = root / "vault"
+        out = root / "out" / "publish"
+        denylist = root / "denylist"
+        planted_project = "Quill" + "stone Labs"
+        planted_email = "ada" + "@" + "example.org"
+        denylist.write_text("# test terms\n" + planted_project + "\n" + "ZQ" + "-\n" + "Sample" + "town\n")
+
+        source = Path(__file__).resolve().parent.parent
+        files, _missing = included(source)
+        for rel in files:
+            write(vault / rel, "")
+            shutil.copy2(source / rel, vault / rel)
+        write(vault / "_Scripts" / "host-restore" / "claude" / "CLAUDE.md", "keep out\n")
+        diary = "Di" + "ary"
+        write(vault / "Personal" / f"{diary}.md", "---\ntags: [personal]\n---\n# Private\n")
+        write(vault / "Index.md", "---\ntags: [meta]\n---\n# Live index\n")
+
+        bare = root / "bare-out"
+        reply, ok = publish(vault, bare, denylist)
+        if ok or publish_scan.MAINTAINER_MESSAGE not in reply or bare.exists():
+            raise SystemExit(f"self-check: missing maintainer setup did not refuse cleanly:\n{reply}")
+        write(vault / "Workspace map.md", (
+            "## Maintainer\n- maintainer: yes\n\n## Ship\n"
+            "| Project | Rule | Folder |\n|---|---|---|\n"
+            f"| Example kit | notedbro | {out} |\n"
+        ))
+
+        reply, ok = publish(vault, out, denylist)
+        if not ok or reply != f"Published: {shown(out)}":
+            raise SystemExit(f"self-check: clean publish failed:\n{reply}")
+        names = {path.relative_to(out).as_posix() for path in iter_files(out)}
+        for rel in names:
+            if rel.startswith("_Scripts/host-restore/"):
+                raise SystemExit(f"self-check: {rel} was published")
+            if rel.startswith("Personal/") and rel not in ("Personal/Personal.md", "Personal/Chats/Chats.md"):
+                raise SystemExit(f"self-check: {rel} was published")
+        for rel in ("Work/Example/Example.md", "Collaboration/Collaboration.md",
+                    "Hackathons/Hackathons.md", "Research/Research.md",
+                    "Personal/Personal.md", "Personal/Chats/Chats.md",
+                    "Workspace map.example.md", ".gitignore", "_Config/bootstrap.md"):
+            if rel not in names:
+                raise SystemExit(f"self-check: {rel} was not generated")
+        if "Live index" in (out / "Index.md").read_text():
+            raise SystemExit("self-check: live Index was copied")
+        for rel in ("Preferences.md", "Parameters.md"):
+            if (out / rel).read_bytes() != (vault / rel).read_bytes():
+                raise SystemExit(f"self-check: {rel} was not copied intact")
+
+        if shutil.which("git"):
+            subprocess.run(["git", "init", "-q", str(out)], check=True)
+            for rel in ("Personal/Diary.md", "Work/Acme/Acme.md", "Work/Example/my-note.md", "School/note.md",
+                        "Research/Topic/Topic.md", "Workspace map.md",
+                        "Plans/plan.md", "Skill files/x.md", "_Scripts/host-restore/x", "a.canvas", "shadow.key"):
+                if not ignored(out, rel):
+                    raise SystemExit(f"self-check: {rel} is not ignored")
+            for rel in ("Work/Example/Example.md", "Research/Research.md", "Personal/Personal.md",
+                        "Personal/Chats/Chats.md", "Workspace map.example.md", "README.md",
+                        "_Scripts/publish"):
+                if ignored(out, rel):
+                    raise SystemExit(f"self-check: {rel} is ignored")
+
+        before = (out / "Index.md").read_text()
+        (out / "marker").write_text("previous\n")
+        for rel, text, kind in (
+            ("Prefixes.md", planted_email, "email ("),
+            ("Terms.md", planted_project.lower(), f"denylist ({planted_project})"),
+            ("Parameters.md", "see " + "ZQ" + "-12", "denylist (" + "ZQ" + "-)"),
+            ("Hosts.md", "the " + PRODUCT + " kit", f"{PRODUCT} outside the title"),
+            ("Hosts.md", str(Path.home()) + "/x", "home folder"),
+        ):
+            original = (vault / rel).read_text()
+            (vault / rel).write_text(original + text + "\n")
+            reply, ok = publish(vault, out, denylist)
+            (vault / rel).write_text(original)
+            if ok or kind not in reply or not reply.endswith("Publish withheld."):
+                raise SystemExit(f"self-check: {kind} was not withheld:\n{reply}")
+            if not (out / "marker").is_file() or (out / "Index.md").read_text() != before:
+                raise SystemExit("self-check: a withheld publish changed the previous folder")
+
+        for word in ("de" + "cision", "month" + "s-1", "zq" + "-1"):
+            if scan_text_hits(word, ["ci" + "si", "ZQ" + "-"]):
+                raise SystemExit(f"self-check: {word!r} matched a term inside a word")
+        if not scan_text_hits("fnsh " + "ci" + "si params", ["ci" + "si"]):
+            raise SystemExit("self-check: a standalone term was missed")
+
+        noise = vault / "assets" / "branding" / "noise.png"
+        noise.parent.mkdir(parents=True, exist_ok=True)
+        noise.write_bytes(b"\x89PNG\r\n\x1a\n" + planted_project.encode("ascii"))
+        reply, ok = publish(vault, out, denylist)
+        if not ok or reply != f"Published: {shown(out)}":
+            raise SystemExit(f"self-check: an image with denylist bytes was withheld:\n{reply}")
+        if not (out / "assets" / "branding" / "noise.png").is_file():
+            raise SystemExit("self-check: the image was not published")
+        noise.unlink()
+
+        write(vault / "Personal" / "Personal.md", "---\ntags: [area]\n---\n# My real hub\n")
+        reply, ok = publish(vault, out, denylist)
+        if not ok or not (out / ".git").is_dir():
+            raise SystemExit(f"self-check: republish lost .git:\n{reply}")
+        if "My real hub" in (out / "Personal" / "Personal.md").read_text():
+            raise SystemExit("self-check: live Personal.md was copied")
+        if not (out / "Personal" / "Chats" / "Chats.md").is_file():
+            raise SystemExit("self-check: starter Chats.md was missing")
+        sample = root / "sample-deny"
+        sample.write_text("SAMPLE-EMPLOYER\nSAMPLE-CLIENT\nSAMPLE-NAME\n")
+        reply, ok = publish(vault, root / "sample-out", sample)
+        if ok or "sample words" not in reply or (root / "sample-out").exists():
+            raise SystemExit(f"self-check: a sample denylist was not refused:\n{reply}")
+        token = "gh" + "p_" + "abcdefghij"
+        if not any("****" in hit for hit in publish_scan.scan_text("token " + token, [])):
+            raise SystemExit("self-check: a token was not masked")
+
+        try:
+            publish(vault, vault / "publish", denylist)
+        except SystemExit as error:
+            if "Refused to write inside the vault" not in str(error):
+                raise
+        else:
+            raise SystemExit("self-check: write inside the vault was allowed")
+    print("self-check ok")
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "self-check":
+        self_check()
+        return
+    reply, ok = publish()
+    print(reply)
+    raise SystemExit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
